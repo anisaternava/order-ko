@@ -1,0 +1,6 @@
+.venv/
+.auth/
+.env
+workflow.json
+reports/
+__pycache__/

@@ -1,0 +1,35 @@
+{
+  "kitchen_number_pattern": "^[0-9]+$",
+  "public": {
+    "url": "https://fragmento.de/",
+    "language": "English",
+    "instruction_label": "Text",
+    "intro_continue_label": "Continue",
+    "kitchen_heading": "Customize your kitchen",
+    "labels": {
+      "component_count": "Components",
+      "summary_heading": "Your selection",
+      "subtotal": "Price",
+      "vat": "VAT (19%)",
+      "total_price": "Total price",
+      "add": "Add +",
+      "remove": "Remove -",
+      "continue_to_order": "Continue to order",
+      "paid_order_button": "Complete paid order"
+    },
+    "contract_input": "#entry-contract-number",
+    "confirm_button": "role=button[name='Confirm']",
+    "plan_image": "img[alt$=' plan']",
+    "images": "img[alt$=' plan']",
+    "known_kitchens": {
+      "111105807": "ab-105807"
+    }
+  },
+  "email": {
+    "provider": "outlook_graph",
+    "search_window_days": 90,
+    "field_patterns": {},
+    "attachment_rules": {},
+    "plan_attachment_pattern": ""
+  }
+}
