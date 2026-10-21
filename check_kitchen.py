@@ -648,7 +648,7 @@ def checkout_check(page, config: dict, run: Run, interactive: bool = False,
             run.add("Checkout submission", "NOT_RUN", "Paid-order button disabled in manual inspection")
             return
         defaults = {"first_name": "max", "last_name": "musterman",
-                    "contact_email": "ternavaanisa@outlook.com", "phone": "000000000"}
+                    "contact_email": "140primex.eu@gmail.com", "phone": "000000000"}
         for key in defaults:
             value = os.getenv(CONTACT_FIELDS[key][0], "").strip() or defaults[key]
             page.locator(CONTACT_FIELDS[key][1]).fill(value)
@@ -811,7 +811,7 @@ def fill_stripe_test_payment(page) -> tuple[bool, str]:
     }
     values = {"number": "4242424242424242", "expiry": expiry, "cvc": cvc}
     for selector, value in (
-        ('input[autocomplete="email"]', os.getenv("FRAGMENTO_CONTACT_EMAIL", "ternavaanisa@outlook.com")),
+        ('input[autocomplete="email"]', os.getenv("FRAGMENTO_CONTACT_EMAIL", "140primex.eu@gmail.com")),
         ('input[autocomplete="cc-name"]', " ".join((os.getenv("FRAGMENTO_FIRST_NAME", "max"),
                                                     os.getenv("FRAGMENTO_LAST_NAME", "musterman")))),
     ):
@@ -870,7 +870,7 @@ from visual_qa import render_attachment
 
 
 def find_browser_email(config: dict, run: Run) -> None:
-    recipient = os.getenv("FRAGMENTO_CONTACT_EMAIL", "ternavaanisa@outlook.com")
+    recipient = os.getenv("FRAGMENTO_CONTACT_EMAIL", "140primex.eu@gmail.com")
     result = inspect_mail(MAIL_PROFILE, config, run.confirmation_reference, recipient,
                           run.started.timestamp(), REPORTS / f"{run.started:%Y%m%d-%H%M%S-%f}-{run.kitchen}",
                           os.getenv("FRAGMENTO_BROWSER_CDP_URL", ""))

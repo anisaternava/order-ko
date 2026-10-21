@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="sq">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fragmento · Kitchen QA</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111a27; --panel:#1b293a; --panel-2:#23354a; --text:#f4f7fb; --muted:#a7b9ca; --accent:#57d4b0; --danger:#ff8c83; --warn:#f0c57a; }
+    * { box-sizing: border-box; } body { margin:0; background:var(--bg); color:var(--text); font:16px "Segoe UI",system-ui,sans-serif; }
+    main { max-width:1200px; margin:auto; padding:32px 22px; } .eyebrow { color:var(--accent); font-weight:700; letter-spacing:.1em; font-size:.78rem; }
+    h1 { margin:.45rem 0 .3rem; font-size:clamp(1.8rem,4vw,2.55rem); } .subtitle { margin:0; color:var(--muted); }
+    .layout { display:grid; grid-template-columns:310px 1fr; gap:18px; margin-top:28px; } .panel { background:var(--panel); border:1px solid #2a4056; border-radius:15px; padding:22px; }
+    label { display:block; color:var(--muted); font-size:.86rem; margin-bottom:8px; } input { width:100%; border:0; border-radius:9px; padding:13px; color:#111a27; background:#f8fafc; font:1.1rem inherit; }
+    button, .report { display:block; width:100%; border:0; border-radius:9px; padding:12px 14px; margin-top:12px; background:var(--panel-2); color:var(--text); font:600 1rem inherit; text-decoration:none; text-align:center; cursor:pointer; }
+    button.primary { background:var(--accent); color:var(--bg); } button:disabled { cursor:not-allowed; opacity:.48; } .divider { height:1px; margin:22px 0; background:#34485c; }
+    .note, #status, .small { color:var(--muted); font-size:.9rem; line-height:1.5; } .topline { display:flex; justify-content:space-between; gap:16px; align-items:center; } #overall { font-weight:800; color:var(--muted); }
+    table { width:100%; border-collapse:collapse; margin-top:18px; font-size:.93rem; } th,td { padding:12px 8px; border-bottom:1px solid #2a4056; text-align:left; vertical-align:top; } th { color:var(--muted); font-size:.78rem; letter-spacing:.06em; } .good { color:var(--accent); } .bad { color:var(--danger); } .pending { color:var(--warn); }
+    dialog { border:1px solid #3b5872; border-radius:15px; background:var(--panel); color:var(--text); width:min(680px,92vw); } dialog::backdrop { background:#0009; } .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; } .form-grid div:last-child:nth-child(odd) { grid-column:span 2; }
+    #toast { min-height:22px; margin-top:14px; color:var(--warn); } @media (max-width:760px) { .layout { grid-template-columns:1fr; } main { padding:22px 14px; } .form-grid { grid-template-columns:1fr; } .form-grid div:last-child:nth-child(odd) { grid-column:auto; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">FRAGMENTO / QA</div>
+    <h1>Kontrollo kuzhinën para porosisë</h1>
+    <p class="subtitle">Udhëtimi publik · pa Admin · pa pagesë ose dërgim porosie</p>
+    <div class="layout">
+      <aside class="panel">
+        <label for="kitchen">NUMRI I KONTRATËS</label>
+        <input id="kitchen" inputmode="numeric" placeholder="p.sh. 111105807" autocomplete="off">
+        <button class="primary" id="start">Nis kontrollin</button>
+        <button id="continue" disabled>Vazhdo</button>
+        <div id="status">Gati për kontroll</div>
+        <div class="divider"></div>
+        <button id="contact">Të dhënat e kontaktit</button>
+        <a id="report" class="report" hidden target="_blank" rel="noopener">Hap raportin</a>
+        <p class="note">Plotëso të dhënat në browser-in që hapet. Butoni i pagesës është i çaktivizuar.</p>
+      </aside>
+      <section class="panel">
+        <div class="topline"><h2>Rezultatet</h2><span id="overall">—</span></div>
+        <table><thead><tr><th>Kontrolli</th><th>Statusi</th><th>Detajet</th></tr></thead><tbody id="checks"><tr><td colspan="3" class="small">Nis një kontroll për të parë rezultatet.</td></tr></tbody></table>
+      </section>
+    </div>
+  </main>
+  <dialog id="contactDialog"><form method="dialog"><div class="topline"><h2>Të dhënat e kontaktit</h2><button value="cancel" style="width:auto;margin:0">Mbyll</button></div><p class="small">Ruhen vetëm në `.env` në këtë kompjuter.</p><div class="form-grid" id="contactFields"></div><button class="primary" id="saveContact" type="button">Ruaj të dhënat</button></form></dialog>
+  <script>
+    const $ = s => document.querySelector(s);
+    const contactLabels = {FRAGMENTO_FIRST_NAME:'Emri',FRAGMENTO_LAST_NAME:'Mbiemri',FRAGMENTO_CONTACT_EMAIL:'Emaili i porosisë',FRAGMENTO_PHONE:'Telefoni',FRAGMENTO_ADDRESS1:'Rruga dhe numri',FRAGMENTO_ADDRESS2:'Adresa shtesë (opsionale)',FRAGMENTO_COUNTRY:'Shteti (si në faqe)',FRAGMENTO_CITY:'Qyteti (si në faqe)',FRAGMENTO_POSTAL_CODE:'Kodi postar (si në faqe)',FRAGMENTO_DELIVERY_WEEK:'Java e dorëzimit',FRAGMENTO_NOTES:'Shënime (opsionale)'};
+    const post = async (url, data={}) => { const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); const j=await r.json(); if(!r.ok) throw Error(j.message||'Ndodhi një gabim.'); return j; };
+    function update(data) { const running=data.running, phase=data.phase; $('#start').disabled=running; $('#continue').disabled=!(phase==='selection'||phase==='form'); $('#continue').textContent=phase==='form'?'E plotësova formën · Verifiko':'Zgjodha opsionet · Vazhdo'; $('#status').textContent=data.error||data.status; const overall=$('#overall'); overall.textContent=data.overall; overall.className=data.overall==='PASS'?'good':data.overall==='FAIL'||data.overall==='GABIM'?'bad':'pending'; const tbody=$('#checks'); tbody.innerHTML=''; if(!data.checks.length) tbody.innerHTML='<tr><td colspan="3" class="small">Nis një kontroll për të parë rezultatet.</td></tr>'; data.checks.forEach(([name,state,detail])=>{const tr=document.createElement('tr'); const cls=['PASS','MATCH'].includes(state)?'good':['FAIL','MISMATCH','NOT_FOUND'].includes(state)?'bad':'pending'; tr.innerHTML=`<td>${escapeHtml(name)}</td><td class="${cls}">${escapeHtml(state)}</td><td>${escapeHtml(detail)}</td>`; tbody.append(tr);}); const report=$('#report'); report.hidden=!data.report_url; if(data.report_url) report.href=data.report_url; }
+    function escapeHtml(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+    async function poll() { try { update(await (await fetch('/api/status')).json()); } catch { $('#status').textContent='Nuk mund të lidhet me serverin lokal.'; } }
+    $('#start').onclick=async()=>{try { const r=await post('/api/start',{kitchen:$('#kitchen').value.trim()}); $('#status').textContent=r.message; poll(); } catch(e) { $('#status').textContent=e.message; }};
+    $('#continue').onclick=async()=>{try { const r=await post('/api/continue'); $('#status').textContent=r.message; poll(); } catch(e) { $('#status').textContent=e.message; }};
+    $('#kitchen').addEventListener('keydown',e=>{if(e.key==='Enter') $('#start').click();});
+    $('#contact').onclick=async()=>{ const values=await (await fetch('/api/contact')).json(); const area=$('#contactFields'); area.innerHTML=''; Object.entries(contactLabels).forEach(([key,label])=>{const wrap=document.createElement('div'); wrap.innerHTML=`<label for="${key}">${label}</label><input id="${key}" value="${escapeHtml(values[key]||'')}">`; area.append(wrap);}); $('#contactDialog').showModal(); };
+    $('#saveContact').onclick=async()=>{ const values={}; Object.keys(contactLabels).forEach(key=>values[key]=$('#'+key).value); try { const r=await post('/api/contact',values); $('#contactDialog').close(); $('#status').textContent=r.message; } catch(e) { $('#status').textContent=e.message; }};
+    poll(); setInterval(poll,1000);
+  </script>
+</body>
+</html>

@@ -19,9 +19,19 @@ If the virtual environment already exists, activate it and install the updated r
 
 Set `public.language` and its translated labels in `workflow.json` if you do not use English. The checker reads the kitchen identifier from the public result, contract query parameter, plan label, and order form. `visual.fixed_plan_reference` can point to an approved image of the starting kitchen, and `visual.plan_references` can map option names to approved images after selection. Without those references the program reports `REVIEW` for semantic placement, even when pixels change.
 
-The requested test contact values are the local defaults: `max`, `musterman`, `ternavaanisa@outlook.com`, `000000000`. Override them only in your private `.env` with `FRAGMENTO_FIRST_NAME`, `FRAGMENTO_LAST_NAME`, `FRAGMENTO_CONTACT_EMAIL`, and `FRAGMENTO_PHONE`. Set `FRAGMENTO_USE_PROPERTY_ADDRESS=true` to choose the site's property/contract address option. For a custom address, set it to `false` and configure `FRAGMENTO_ADDRESS1`, `FRAGMENTO_COUNTRY`, `FRAGMENTO_CITY`, and `FRAGMENTO_POSTAL_CODE` using the visible site choices. `FRAGMENTO_DELIVERY_WEEK` is optional; when blank the site's displayed default is used. `FRAGMENTO_NOTES` is optional.
+The requested test contact values are the local defaults: `max`, `musterman`, `140primex.eu@gmail.com`, `000000000`. Override them only in your private `.env` with `FRAGMENTO_FIRST_NAME`, `FRAGMENTO_LAST_NAME`, `FRAGMENTO_CONTACT_EMAIL`, and `FRAGMENTO_PHONE`. Set `FRAGMENTO_USE_PROPERTY_ADDRESS=true` to choose the site's property/contract address option. For a custom address, set it to `false` and configure `FRAGMENTO_ADDRESS1`, `FRAGMENTO_COUNTRY`, `FRAGMENTO_CITY`, and `FRAGMENTO_POSTAL_CODE` using the visible site choices. `FRAGMENTO_DELIVERY_WEEK` is optional; when blank the site's displayed default is used. `FRAGMENTO_NOTES` is optional.
 
 ## Run
+
+### Local web interface
+
+Start the local website, then open [http://127.0.0.1:8765](http://127.0.0.1:8765) in a browser:
+
+```powershell
+python web_app.py
+```
+
+The website is accessible only from this computer. It provides the same safe interactive check as the desktop app, including local contact-data editing and links to generated reports.
 
 The safe pre-submit verification is:
 
