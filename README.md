@@ -1,30 +1,13 @@
-# Fragmento public kitchen QA checker
+﻿# Fragmento public visual QA
 
-This tool follows the **public customer journey** on `fragmento.de`. It takes a purchase contract number, chooses the configured language and Text instructions, opens the kitchen, checks its plan, exercises available Add options, opens the customer order form, and compares the visible pre-submit summary with the selected options. It stops before **Complete paid order**. It does not use Admin or a dashboard.
-
-## Desktop app
-
-After the one-time setup below, double-click [start_fragmento.cmd](start_fragmento.cmd), or run:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python app.py
-```
-
-Enter the purchase contract number and click **Nis kontrollin**. The app lists each result and opens the HTML report with **Hap raportin**. Use **Të dhënat e kontaktit** to fill the local `.env` form; its values are not shown in the results table or report. The app runs the same `check_kitchen.py` engine as the command line, so existing reports and safety limits still apply. `INCOMPLETE` is expected because the final paid-order action is intentionally not run.
-
-The flow was inspected with contract `111105807`, which opens `ab-105807`. The page shows an order form after **Continue to order**. The final button starts a paid order through Stripe, so a normal check never clicks it. No official test checkout was visible in the public flow.
-
-When you click **Nis kontrollin**, a visible browser opens the public site. Choose the options you want there, then click **Zgjodha opsionet · Vazhdo** in the app. The app checks each available choice by changing and restoring it, then opens the real Fragmento contact and delivery form. Fill that form using the site's live dropdown choices and click **E plotësova formën · Verifiko**. The local contact editor is optional and only prefills the real form. The paid-order button is disabled during this check; the app never requests card number or CVV.
+`check_kitchen.py` follows the public customer journey at `https://fragmento.de/`. It does not use Admin, Microsoft Graph, or a browser extension. Supply any purchase contract number. The public page determines the kitchen and available components.
 
 ## Windows PowerShell setup
 
-From this project directory:
-
 ```powershell
+cd C:\Users\User\Documents\order-ko
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m playwright install chromium
 Copy-Item workflow.example.json workflow.json
@@ -32,56 +15,63 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-If activation is blocked, run `Set-ExecutionPolicy -Scope Process Bypass` in that PowerShell window and activate again. `.env`, `workflow.json`, `.auth/`, and `reports/` are excluded from Git. Keep all contact details in `.env`, not in source code.
+If the virtual environment already exists, activate it and install the updated requirements. `.env`, `workflow.json`, `.auth/`, and `reports/` are excluded from Git.
 
-Set these checkout fields in `.env` for automatic prefill or command-line checks. In the desktop app, you may fill the live form directly instead:
+Set `public.language` and its translated labels in `workflow.json` if you do not use English. The checker reads the kitchen identifier from the public result, contract query parameter, plan label, and order form. `visual.fixed_plan_reference` can point to an approved image of the starting kitchen, and `visual.plan_references` can map option names to approved images after selection. Without those references the program reports `REVIEW` for semantic placement, even when pixels change.
 
-| Variable | Visible Fragmento field | Example format |
-| --- | --- | --- |
-| `FRAGMENTO_FIRST_NAME` | First name | Text |
-| `FRAGMENTO_LAST_NAME` | Last name | Text |
-| `FRAGMENTO_CONTACT_EMAIL` | Email | Email address that should receive an order confirmation |
-| `FRAGMENTO_PHONE` | Phone | International phone number |
-| `FRAGMENTO_ADDRESS1` | Address (street, no.) | Street and number |
-| `FRAGMENTO_COUNTRY` | Country | Visible dropdown label, such as `Poland` |
-| `FRAGMENTO_CITY` | City | Visible dropdown label for that country, such as `Warsaw` |
-| `FRAGMENTO_POSTAL_CODE` | Postal code | Visible dropdown label for that city, such as `00-001` |
-| `FRAGMENTO_DELIVERY_WEEK` | Preferred delivery week | `After 4 weeks`, `After 5 weeks`, or `After 6 weeks` in English |
+The requested test contact values are the local defaults: `max`, `musterman`, `ternavaanisa@outlook.com`, `000000000`. Override them only in your private `.env` with `FRAGMENTO_FIRST_NAME`, `FRAGMENTO_LAST_NAME`, `FRAGMENTO_CONTACT_EMAIL`, and `FRAGMENTO_PHONE`. Set `FRAGMENTO_USE_PROPERTY_ADDRESS=true` to choose the site's property/contract address option. For a custom address, set it to `false` and configure `FRAGMENTO_ADDRESS1`, `FRAGMENTO_COUNTRY`, `FRAGMENTO_CITY`, and `FRAGMENTO_POSTAL_CODE` using the visible site choices. `FRAGMENTO_DELIVERY_WEEK` is optional; when blank the site's displayed default is used. `FRAGMENTO_NOTES` is optional.
 
-`FRAGMENTO_ADDRESS2` and `FRAGMENTO_NOTES` are optional. The country, city, and postal code must be choices offered by the site; the program reports a form failure if a configured choice is unavailable. The program fills these fields and reads them back but does not agree to terms or submit the order. Reports say whether each field matches local configuration without printing personal values. Screenshots of the filled form mask inputs, selects, and notes. Do not put card numbers, CVV, payment passwords, or payment tokens in `.env`.
+## Run
 
-Set `public.language` in `workflow.json`. The included values are for the inspected **English** flow. For another language, also set its displayed `instruction_label`, `intro_continue_label`, `kitchen_heading`, `confirm_button`, and translated `labels` entries. Other translations have not been verified. `known_kitchens` includes the verified example mapping; new contract numbers use the public contract entry lookup, so no source edit is needed.
+The safe pre-submit verification is:
 
-Run:
+```powershell
+python check_kitchen.py --kitchen 111105807 --pre-submit-only
+```
+
+For a new authorized test order, the full run submits the Fragmento form and follows its Stripe redirect:
 
 ```powershell
 python check_kitchen.py --kitchen 111105807
-# or, to be prompted:
-python check_kitchen.py
 ```
 
-Each run writes a timestamped HTML file in `reports\` plus screenshots. A normal safe run is `INCOMPLETE` overall because submission is deliberately `NOT_RUN`. Public checks and pre-submit comparisons receive their own PASS/FAIL status. The command exits with code 1 for incomplete or failed runs.
+Without `--kitchen`, the program prompts `Enter purchase contract / kitchen number:`. Each run writes an HTML report and screenshots under `reports\`. A nonzero exit code means FAIL or INCOMPLETE. An overall PASS requires successful order confirmation, matching email, and all visual/data checks.
 
-## Existing confirmation email
+The checker discovers summary rows and enabled Add/Remove cards for the current kitchen. It checks each selectable card's state, preserves the other elements, compares name/count/price and the rendered plan before/after, and leaves intended options selected. Fixed or already confirmed rows are inventoried but their placement is marked `REVIEW` without an approved visual reference. An unchanged plan also produces `REVIEW`; a successful click does not prove the drawing is correct.
 
-An email can only be compared if it **already exists** for the exact contract number (or a verified order reference). The tool never uses the newest unrelated email. It does not place an order to create an email.
+## Stripe payment boundary
 
-To read an Outlook.com inbox, set `FRAGMENTO_MS_CLIENT_ID` to a Microsoft public client app ID and `FRAGMENTO_MAIL_ADDRESS` to the account being authorized, such as `ternavaanisa@outlook.com`. The app must support personal Microsoft accounts and delegated `Mail.Read` and `User.Read`. Then authorize once:
+The script accepts the privacy/terms checkboxes for the requested test order. After `Complete paid order`, it identifies a test Stripe Checkout session only from a `cs_test_` session identifier on `checkout.stripe.com`. If it sees `cs_live_` or cannot verify the mode, it stops before Pay. Clicking the Fragmento button may create a pending order even when payment is not completed. The test card number is held in code only for a verified test session. Supply a valid future expiry and test CVC for that PowerShell process, not in Git or the report:
 
 ```powershell
-python check_kitchen.py --setup-mail
+$env:FRAGMENTO_TEST_EXPIRY='12/34'
+$env:FRAGMENTO_TEST_CVC='123'
+python check_kitchen.py --kitchen 111105807
+Remove-Item Env:\FRAGMENTO_TEST_EXPIRY,Env:\FRAGMENTO_TEST_CVC
 ```
 
-The read-only token cache stays in `.auth/`. Normal runs use it silently. In `workflow.json`, add `email.field_patterns` after inspecting a **real matching confirmation email**. Keys should match summary keys such as `contract_number`, `total_price`, `option:Lighting set with 3 LED spotlights:price`, or `delivery:city`; values are regular expressions with a first or named `value` capture group. For example: `"total_price": "^Total price:\\s*(?P<value>.+)$"`. An absent, ambiguous, or inaccessible email never counts as a match. No card or payment credential fields are extracted or reported.
+Payment fields are never put in screenshots, traces, or reports. If Stripe's visible fields or redirect cannot be automated, the result is INCOMPLETE. Stripe [documents test cards and test mode](https://docs.stripe.com/testing) and [notes limits of automating Checkout](https://docs.stripe.com/automated-testing).
 
-For attachments, set `email.attachment_rules` in `workflow.json` using document labels shown on selected components (such as `E-Label PDF`) and filename regular expressions learned from a real email. Set `email.plan_attachment_pattern` for the plan attachment. The checker reads attachments only from the exact matching message. It compares plan bytes when the public file and attachment share a format; different formats remain `INCOMPLETE` until a visual comparison method is configured. Different bytes alone do not prove the drawings differ. Without a matching email and these rules, attachment and sketch equality are not claimed.
+## Existing signed-in Outlook browser
 
-Microsoft documents the [Graph message API](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0), [attachment listing](https://learn.microsoft.com/en-us/graph/api/message-list-attachments?view=graph-rest-1.0), and [device code sign-in](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-acquire-token-device-code-flow).
+A new Playwright browser does not inherit a login from an ordinary already-open browser. To create a reusable visible Outlook session, run:
 
-## Check limits
+```powershell
+python check_kitchen.py --setup-mail-browser
+```
 
-- The tool verifies contract number in the opened URL and order form, the kitchen slug and plan label, image loading, Add to Remove state changes, component count, option prices, subtotal, VAT, and total. It saves before and after selection screenshots.
-- It exercises enabled Add options visible in the catalog. Fixed, already confirmed, and other custom controls are displayed in the screenshots but need separate business rules for automated interaction checks.
-- It confirms that the visible order summary agrees with the selected options and that locally configured contact fields display as entered. The site does not show a separate final confirmation before the paid-order button.
-- An actual submitted order, Stripe payment, final confirmation screen, and newly generated email require an authorized official test checkout or an existing order. None is claimed by a normal run.
-- Screenshots show appearance and state; judging whether a rendered design is visually correct needs an approved reference image or explicit design rules.
+Sign in inside the opened Outlook window and press Enter in PowerShell. The browser profile remains in ignored `.auth\outlook-browser`. No email password is entered into this program. Alternatively, set `FRAGMENTO_BROWSER_CDP_URL` to a local Chromium remote-debugging endpoint that you launched with the desired signed-in profile. The tool only reads that browser's visible Outlook UI.
+
+After a **confirmed test order with an order reference**, the checker searches Outlook for that exact reference and checks the recipient. It waits up to `email.wait_seconds` in `workflow.json`. It never treats the newest message as a match. Configure `email.field_patterns` from an actual message to extract fields for comparison with the order summary, and `email.plan_attachment_pattern` to find the sketch attachment by its visible name. It attempts to download that attachment through Outlook's UI and render PDF/image files for visual comparison. If sign-in, reference, attachment, or visual evidence is unavailable, it reports `EMAIL_NOT_CHECKED`, `REVIEW`, or `INCOMPLETE`, not PASS.
+
+To check an already placed order without submitting or paying again, use the saved checkout report:
+
+```powershell
+python check_kitchen.py --kitchen 111105807 --email-only --order-reference 111105807-2 --from-report reports\20261020-234211-233381-111105807.html
+```
+
+This command reads the saved selection, summary, and plan, then searches Outlook. It makes no Fragmento checkout call. Leave the setup browser closed after signing in so the same profile can be reopened for the check.
+
+## Current result for 111105807
+
+The public site opened `ab-105807`. The final order included the lighting set for €69, with one unit; pickup was tested and then deselected because the fixed assembly service makes the two incompatible. The displayed subtotal €57.98 plus VAT €11.02 equaled €69.00. A verified Stripe `cs_test_` checkout accepted the test payment, and Fragmento showed **Bestellung bestätigt**, order **111105807-2**. See [the saved checkout report](reports/20261020-234211-233381-111105807.html) and its confirmation screenshot. The original report labels confirmation `REVIEW` because it read the page before the reference appeared; the screenshot contains the reference, and the wait/parser was fixed afterward. The plan did not visibly change when lighting or pickup was toggled, so visual placement remains `REVIEW` without an approved reference. Outlook email, attachment, and sketch comparisons remain `EMAIL_NOT_CHECKED`/`INCOMPLETE` until the reusable Outlook profile is signed in and an exact-reference message is found.

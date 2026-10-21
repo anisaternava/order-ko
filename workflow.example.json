@@ -21,15 +21,21 @@
     "confirm_button": "role=button[name='Confirm']",
     "plan_image": "img[alt$=' plan']",
     "images": "img[alt$=' plan']",
-    "known_kitchens": {
-      "111105807": "ab-105807"
+    "incompatible_when_fixed": {
+      "Pickup at logistics location": "Delivery, Carry-in, Assembly and Installation"
     }
   },
   "email": {
-    "provider": "outlook_graph",
-    "search_window_days": 90,
+    "url": "https://outlook.live.com/mail/",
+    "wait_seconds": 120,
     "field_patterns": {},
     "attachment_rules": {},
     "plan_attachment_pattern": ""
+  },
+  "visual": {
+    "minimum_changed_fraction": 0.003,
+    "fixed_plan_reference": "",
+    "reference_tolerance": 0.02,
+    "plan_references": {}
   }
 }

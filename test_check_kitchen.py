@@ -1,10 +1,14 @@
 import tempfile
 import unittest
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from PIL import Image
 
 import check_kitchen as checker
+from mail_browser import reference_present
+from visual_qa import compare_plan_images
 
 
 class KitchenCheckerTests(unittest.TestCase):
@@ -54,19 +58,37 @@ class KitchenCheckerTests(unittest.TestCase):
         self.assertIn("INCOMPLETE", report)
         self.assertIn("No &lt;matching&gt; email", report)
 
-    def test_attachment_rules_apply_only_to_exact_matching_message(self):
-        run = checker.Run("12345")
-        run.expected_documents = {"Lighting": ["E-Label PDF"]}
-        message = {"id": "message-1", "hasAttachments": True}
-        config = {"attachment_rules": {"E-Label PDF": r"label.*\.pdf$"}}
-        attachments = {"value": [{"name": "lighting-label.pdf", "contentType": "application/pdf"}]}
-        with patch.object(checker, "graph_get", return_value=attachments) as graph:
-            checker.check_email_attachments(config, run, message, "token")
-        graph.assert_called_once_with(
-            "https://graph.microsoft.com/v1.0/me/messages/message-1/attachments", "token")
-        statuses = {check.name: check.status for check in run.checks}
-        self.assertEqual(statuses["Email document Lighting: E-Label PDF"], "PASS")
-        self.assertEqual(statuses["Email plan file"], "UNCONFIGURED")
+    def test_email_only_source_restores_order_without_browser(self):
+        original = checker.Run("12345")
+        original.selection = {"contract_number": "12345", "total_price": "69.00"}
+        original.summary = dict(original.selection)
+        original.final_plan = "sample/final-plan.png"
+        original.confirmation_reference = "12345-2"
+        with tempfile.TemporaryDirectory() as temp, patch.object(checker, "REPORTS", Path(temp)):
+            report = checker.write_report(original)
+            restored = checker.Run("12345")
+            checker.load_order_source(report, "12345", restored)
+        self.assertEqual(restored.selection, original.selection)
+        self.assertEqual(restored.confirmation_reference, "12345-2")
+        self.assertEqual(restored.final_plan, "sample/final-plan.png")
+
+    def test_stripe_mode_requires_explicit_test_session(self):
+        self.assertEqual(checker.stripe_mode("https://checkout.stripe.com/c/pay/cs_test_abc123"), "test")
+        self.assertEqual(checker.stripe_mode("https://checkout.stripe.com/c/pay/cs_live_abc123"), "live")
+        self.assertEqual(checker.stripe_mode("https://fragmento.de/cs_test_abc123"), "unknown")
+        self.assertEqual(checker.stripe_mode("https://evilstripe.com/c/pay/cs_test_abc123"), "unknown")
+
+    def test_mail_reference_requires_exact_order_token(self):
+        self.assertTrue(reference_present("Order AB-123 confirmed", "AB-123"))
+        self.assertFalse(reference_present("Order AB-1234 confirmed", "AB-123"))
+
+    def test_plan_comparison_detects_changed_pixels(self):
+        def png(color):
+            output = BytesIO()
+            Image.new("RGB", (20, 20), color).save(output, "PNG")
+            return output.getvalue()
+        self.assertEqual(compare_plan_images(png("white"), png("white"))["changed_fraction"], 0)
+        self.assertGreater(compare_plan_images(png("white"), png("black"))["changed_fraction"], 0.9)
 
 
 if __name__ == "__main__":

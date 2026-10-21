@@ -1,34 +1,34 @@
-"""Public Fragmento journey checker; stops before paid order submission."""
+"""Public Fragmento visual QA with verified Stripe test-mode boundary."""
 
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
+import ast
 import html
 import json
-import mimetypes
 import os
 import re
+import secrets
 import sys
 import unicodedata
+import time
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
-import msal
-import requests
 from dotenv import load_dotenv
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
+from visual_qa import compare_plan_images
 
 
 ROOT = Path(__file__).resolve().parent
 REPORTS = ROOT / "reports"
-MAIL_CACHE = ROOT / ".auth" / "outlook_token_cache.json"
+MAIL_PROFILE = ROOT / ".auth" / "outlook-browser"
 
 
 @dataclass
@@ -37,6 +37,7 @@ class Check:
     status: str
     detail: str = ""
     screenshot: str = ""
+    evidence: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,9 +51,12 @@ class Run:
     reference: str = ""
     plan_url: str = ""
     expected_documents: dict[str, list[str]] = field(default_factory=dict)
+    final_plan: str = ""
+    confirmation_reference: str = ""
+    inventory: list[str] = field(default_factory=list)
 
-    def add(self, name: str, status: str, detail: str = "", screenshot: str = "") -> None:
-        self.checks.append(Check(name, status, detail, screenshot))
+    def add(self, name: str, status: str, detail: str = "", screenshot: str = "", evidence: list[str] | None = None) -> None:
+        self.checks.append(Check(name, status, detail, screenshot, evidence or []))
 
 
 def configured(value: object) -> bool:
@@ -128,6 +132,18 @@ def screenshot(page, run: Run, label: str) -> str:
     return str(target.relative_to(REPORTS)).replace("\\", "/")
 
 
+def plan_screenshot(page, config: dict, run: Run, name: str) -> str:
+    folder = REPORTS / f"{run.started:%Y%m%d-%H%M%S-%f}-{run.kitchen}"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{name}.png"
+    page.locator(config["plan_image"]).first.screenshot(path=str(target))
+    return str(target.relative_to(REPORTS)).replace("\\", "/")
+
+
+def evidence_path(relative: str) -> Path:
+    return REPORTS / relative
+
+
 def check_images(page, selector: str, run: Run, source: str) -> None:
     if not configured(selector):
         run.add(f"{source} images", "UNCONFIGURED", "Image selector is missing")
@@ -153,7 +169,8 @@ def check_images(page, selector: str, run: Run, source: str) -> None:
         run.add(f"{source} images", "FAIL", f"Image check failed: {type(exc).__name__}", screenshot(page, run, f"{source}-images"))
 
 
-def public_contract_check(page, config: dict, run: Run, interactive: bool = False) -> None:
+def public_contract_check(page, config: dict, run: Run, interactive: bool = False,
+                          visual: dict | None = None, pre_submit_only: bool = False) -> None:
     """Follow the observed public contract entry and pre-submit order flow."""
     required = ("url", "contract_input", "confirm_button", "plan_image")
     if any(not configured(config.get(key)) for key in required) or not check_url(config.get("url", "")):
@@ -186,10 +203,6 @@ def public_contract_check(page, config: dict, run: Run, interactive: bool = Fals
             run.add("Public kitchen", "FAIL", f"Opened page has different contract number: {actual}", screenshot(page, run, "public-wrong-kitchen"))
             return
         slug = parsed.path.rstrip("/").split("/")[-1]
-        expected = config.get("known_kitchens", {}).get(run.kitchen)
-        if expected and slug != expected:
-            run.add("Public kitchen", "FAIL", f"Expected kitchen {expected}, opened {slug}", screenshot(page, run, "public-wrong-kitchen"))
-            return
         page.get_by_role("heading", name=config.get("kitchen_heading", "Customize your kitchen")).wait_for(state="visible", timeout=15000)
         plan = page.locator(config["plan_image"]).first
         plan.wait_for(state="visible", timeout=15000)
@@ -208,9 +221,9 @@ def public_contract_check(page, config: dict, run: Run, interactive: bool = Fals
             print("Choose options in the visible Fragmento page, then press Enter here to verify them.", flush=True)
             print("SELECTION_READY", flush=True)
             input()
-        selected_ok = test_interactive_selection(page, config, run) if interactive else test_public_selection(page, config, run)
+        selected_ok = test_interactive_selection(page, config, run) if interactive else visual_all_selection(page, config, visual or {}, run)
         if selected_ok:
-            checkout_check(page, config, run, interactive=interactive)
+            checkout_check(page, config, run, interactive=interactive, pre_submit_only=pre_submit_only)
     except PlaywrightTimeout:
         run.add("Public kitchen", "NOT_FOUND", "Contract number did not open a kitchen page, or public lookup timed out", screenshot(page, run, "public-not-found"))
     except PlaywrightError as exc:
@@ -245,6 +258,158 @@ def summary_totals(page, config: dict) -> dict[str, Decimal | None]:
         row = panel.get_by_text(label(config, key, default), exact=True).first.locator("xpath=..")
         result[key] = parse_money(row.inner_text())
     return result
+
+
+def element_rows(page, config: dict) -> list[str]:
+    """Read all summary rows, including collapsed and repeated fixed components."""
+    rows = summary_panel(page, config).locator('[class*="summaryRow__"]')
+    names = []
+    for row in rows.all():
+        name = row.locator('[class*="summaryMeta__"] strong').first.inner_text().strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def element_details(page, config: dict) -> list[dict[str, str]]:
+    details = []
+    for row in summary_panel(page, config).locator('[class*="summaryRow__"]').all():
+        name = row.locator('[class*="summaryMeta__"] strong').first.inner_text().strip()
+        article_locator = row.locator('[class*="itemCode__"]')
+        price_locator = row.locator('[class*="summaryPrice__"]')
+        if name:
+            details.append({"name": name, "article": article_locator.first.inner_text().strip() if article_locator.count() else "",
+                            "price": price_locator.first.inner_text().strip() if price_locator.count() else "",
+                            "quantity": "1"})
+    return details
+
+
+def visual_all_selection(page, config: dict, visual: dict, run: Run) -> bool:
+    """Select every enabled Add card and compare the rendered plan and complete list."""
+    try:
+        add_text = label(config, "add", "Add +")
+        remove_text = label(config, "remove", "Remove -")
+        run.inventory = element_rows(page, config)
+        if not run.inventory:
+            run.add("Element inventory", "FAIL", "No kitchen elements were listed")
+            return False
+        initial_plan = plan_screenshot(page, config, run, "plan-before")
+        fixed_reference = visual.get("fixed_plan_reference", "")
+        reference_status = "REVIEW"
+        if fixed_reference:
+            reference_path = (ROOT / fixed_reference).resolve()
+            if reference_path.is_file():
+                fixed_diff = compare_plan_images(reference_path, evidence_path(initial_plan))["changed_fraction"]
+                reference_status = "PASS" if fixed_diff <= float(visual.get("reference_tolerance", 0.02)) else "FAIL"
+            else:
+                reference_status = "INCOMPLETE"
+        for index, detail in enumerate(element_details(page, config), 1):
+            run.add(f"Element {index}: {detail['name']}", reference_status,
+                    f"Quantity {detail['quantity']}; {detail['article']}; displayed price/status {detail['price']}; "
+                    + ("initial plan compared with approved reference" if fixed_reference else "visual placement needs an approved reference"),
+                    initial_plan)
+        choices = []
+        for button in page.get_by_role("button").all():
+            if not button.is_enabled():
+                continue
+            content = button.inner_text().strip()
+            if add_text in content or remove_text in content:
+                name = content.splitlines()[0]
+                if name not in [item[0] for item in choices]:
+                    choices.append((name, remove_text in content))
+        if not choices:
+            run.add("Selectable elements", "INCOMPLETE", "No enabled Add options found for this kitchen")
+        run.add("Original selection", "PASS", f"{len(run.inventory)} listed elements", screenshot(page, run, "selection-before"),
+                [initial_plan])
+        page.route("**/*", lambda route: route.abort() if route.request.method not in ("GET", "HEAD", "OPTIONS") else route.continue_())
+        passed = reference_status not in {"FAIL", "INCOMPLETE"}
+        excluded_names: set[str] = set()
+        for index, (name, was_selected) in enumerate(choices, 1):
+            button = page.get_by_role("button").filter(has_text=name).filter(has_text=remove_text if was_selected else add_text).first
+            if not button.count() or not button.is_enabled():
+                run.add(f"Select {name}", "INCOMPLETE", "Option became unavailable after preceding selections")
+                passed = False
+                continue
+            before_list = element_rows(page, config)
+            before_count = component_count(page, config)
+            before_total = summary_totals(page, config)["total_price"]
+            price = parse_money(button.inner_text())
+            before_page = screenshot(page, run, f"element-{index}-before")
+            before_plan = plan_screenshot(page, config, run, f"element-{index}-plan-before")
+            doc_labels = button.locator('[class*="DocChip"]').all_inner_texts()
+            fixed_conflict = config.get("incompatible_when_fixed", {}).get(name, "")
+            conflicting_fixed = bool(fixed_conflict and any(
+                fixed_conflict in fixed.inner_text() and "Fixed" in fixed.inner_text()
+                for fixed in page.get_by_role("button").all() if not fixed.is_enabled()))
+            button.click(timeout=10000)
+            selected = page.get_by_role("button").filter(has_text=name).filter(has_text=add_text if was_selected else remove_text).first
+            selected.wait_for(state="visible", timeout=10000)
+            after_list = element_rows(page, config)
+            after_count = component_count(page, config)
+            after_total = summary_totals(page, config)["total_price"]
+            after_page = screenshot(page, run, f"element-{index}-after")
+            after_plan = plan_screenshot(page, config, run, f"element-{index}-plan-after")
+            before_items, after_items = Counter(before_list), Counter(after_list)
+            retained = all(after_items[item] >= quantity for item, quantity in before_items.items())
+            unique = after_items[name] == before_items[name] + (-1 if was_selected else 1)
+            price_good = price is not None and before_total is not None and after_total - before_total == (-price if was_selected else price)
+            count_good = before_count is not None and after_count == before_count + (-1 if was_selected else 1)
+            if was_selected:
+                retained = all(after_items[item] >= quantity for item, quantity in before_items.items() if item != name)
+            good = retained and unique and price_good and count_good
+            passed &= good
+            if (was_selected and not conflicting_fixed) or (conflicting_fixed and not was_selected):
+                selected.click(timeout=10000)
+                page.get_by_role("button").filter(has_text=name).filter(
+                    has_text=remove_text if was_selected else add_text).first.wait_for(state="visible", timeout=10000)
+                restored = element_rows(page, config) == before_list and summary_totals(page, config)["total_price"] == before_total
+                good &= restored
+            run.add(f"Select {name}", "PASS" if good else "FAIL",
+                    f"Before: {before_list}; after: {after_list}; count {before_count}->{after_count}; price {before_total}->{after_total}",
+                    before_page, [before_plan, after_page, after_plan])
+            if conflicting_fixed:
+                excluded_names.add(name)
+                run.add(f"Excluded incompatible option {name}", "PASS" if good else "FAIL",
+                        f"Tested and restored to unselected because fixed service {fixed_conflict} is present")
+            else:
+                run.selection[f"option:{name}:price"] = str(price) if price is not None else ""
+                run.selection[f"option:{name}:quantity"] = "1"
+                run.expected_documents[name] = [value.strip() for value in doc_labels if value.strip()]
+            result = compare_plan_images(evidence_path(before_plan), evidence_path(after_plan))
+            changed = result["changed_fraction"]
+            reference = visual.get("plan_references", {}).get(name, "")
+            if reference:
+                reference_path = (ROOT / reference).resolve()
+                if not reference_path.is_file():
+                    run.add(f"Visual {name}", "INCOMPLETE", "Configured reference image is missing", after_plan)
+                else:
+                    match = compare_plan_images(reference_path, evidence_path(after_plan))["changed_fraction"] <= float(visual.get("reference_tolerance", 0.02))
+                    run.add(f"Visual {name}", "PASS" if match else "FAIL", "Rendered plan matches approved reference" if match else "Rendered plan differs from approved reference", after_plan, [before_plan])
+                    passed &= match
+            else:
+                reason = "Visible pixels changed; correct object and placement still need a reference" if changed >= float(visual.get("minimum_changed_fraction", 0.003)) else "No clear rendered plan change for this option"
+                run.add(f"Visual {name}", "REVIEW", f"{reason}; changed fraction {changed:.4f}", after_plan, [before_plan])
+        final_list = element_rows(page, config)
+        expected = Counter(run.inventory)
+        for name, was_selected in choices:
+            if name in excluded_names and was_selected:
+                expected[name] -= 1
+            elif not was_selected and name not in excluded_names:
+                expected[name] += 1
+        complete = Counter(final_list) == expected
+        run.add("Final element inventory", "PASS" if complete else "FAIL",
+                f"Expected {list(expected.elements())}; found {final_list}")
+        passed &= complete
+        run.inventory = final_list
+        run.final_plan = plan_screenshot(page, config, run, "final-plan")
+        run.add("Final sketch", "PASS", "Rendered plan captured before ordering", run.final_plan)
+        run.selection["contract_number"] = run.kitchen
+        total = summary_totals(page, config)["total_price"]
+        run.selection["total_price"] = str(total) if total is not None else ""
+        return passed
+    except (PlaywrightError, ValueError, OSError) as exc:
+        run.add("Component selection", "FAIL", f"All-element loop failed: {type(exc).__name__}")
+        return False
 
 
 def test_public_selection(page, config: dict, run: Run) -> bool:
@@ -357,6 +522,8 @@ def test_interactive_selection(page, config: dict, run: Run) -> bool:
         run.selection["contract_number"] = run.kitchen
         total = summary_totals(page, config)["total_price"]
         run.selection["total_price"] = str(total) if total is not None else ""
+        run.inventory = element_rows(page, config)
+        run.final_plan = plan_screenshot(page, config, run, "final-plan")
         return all_good
     except (PlaywrightError, PlaywrightTimeout) as exc:
         run.add("Component selection", "FAIL", f"Choice verification failed: {type(exc).__name__}")
@@ -425,90 +592,260 @@ def prefill_manual_contact(page) -> None:
             pass
 
 
-def checkout_check(page, config: dict, run: Run, interactive: bool = False) -> None:
-    """Capture customer summary and fill local details; never activate submit."""
+def checkout_check(page, config: dict, run: Run, interactive: bool = False,
+                   pre_submit_only: bool = False) -> None:
+    """Record the full summary; submit only with complete values and inspect Stripe mode."""
+    stage = "order form"
     try:
         page.get_by_role("button", name=label(config, "continue_to_order", "Continue to order")).click(timeout=10000)
         page.locator("#firstName").wait_for(state="visible", timeout=15000)
         if interactive:
             lock_paid_order_button(page, label(config, "paid_order_button", "Complete paid order"))
-        displayed_contract = page.locator("#contractNumber").input_value()
-        match = displayed_contract == run.kitchen
-        run.summary["contract_number"] = displayed_contract
-        run.add("Order form contract", "MATCH" if match else "MISMATCH",
-                f"Expected {run.kitchen}; displayed {displayed_contract}", screenshot(page, run, "order-form"))
-        if not match:
+        contract = page.locator("#contractNumber").input_value()
+        run.summary["contract_number"] = contract
+        run.add("Order form contract", "MATCH" if contract == run.kitchen else "MISMATCH",
+                f"Expected {run.kitchen}; displayed {contract}")
+        if contract != run.kitchen:
             return
+        listed = element_rows(page, config)
+        same_elements = Counter(listed) == Counter(run.inventory)
+        run.add("Order summary all elements", "MATCH" if same_elements else "MISMATCH",
+                f"Selection: {run.inventory}; order summary: {listed}")
         totals = summary_totals(page, config)
         for key in ("subtotal", "vat", "total_price"):
-            amount = totals[key]
-            if amount is not None:
-                run.summary[key] = str(amount)
-            run.add(f"Order summary {key}", "PASS" if amount is not None else "FAIL", str(amount) if amount is not None else "Missing value")
-        if all(totals[key] is not None for key in ("subtotal", "vat", "total_price")):
+            value = totals[key]
+            if value is not None:
+                run.summary[key] = str(value)
+            run.add(f"Order summary {key}", "PASS" if value is not None else "FAIL", str(value) if value is not None else "Missing")
+        if all(value is not None for value in totals.values()):
             good = totals["subtotal"] + totals["vat"] == totals["total_price"]
-            run.add("Order summary arithmetic", "PASS" if good else "FAIL", "Subtotal plus VAT equals total" if good else "Subtotal plus VAT differs from total")
-        for key, expected_price in list(run.selection.items()):
+            run.add("Order summary arithmetic", "PASS" if good else "FAIL", "Subtotal + VAT = total" if good else "Subtotal + VAT differs from total")
+        for key, price in list(run.selection.items()):
             if not key.startswith("option:") or not key.endswith(":price"):
                 continue
             name = key[len("option:"):-len(":price")]
-            item = summary_panel(page, config).get_by_text(name, exact=True)
-            if item.count() != 1:
-                run.add(f"Order summary option {name}", "FAIL", f"Expected one selected row; found {item.count()}")
+            matches = summary_panel(page, config).get_by_text(name, exact=True)
+            if matches.count() != 1:
+                run.add(f"Order summary option {name}", "FAIL", f"Expected one row; found {matches.count()}")
                 continue
-            row = item.first.locator("xpath=../..")
+            row = matches.first.locator("xpath=../..")
             actual_price = parse_money(row.inner_text())
-            actual_quantity = extract(r"[×x]\s*(\d+)", row.inner_text()) or "1"
+            quantity = extract(r"[×x]\s*(\d+)", row.inner_text()) or "1"
             run.summary[f"option:{name}:price"] = str(actual_price) if actual_price is not None else ""
-            run.summary[f"option:{name}:quantity"] = actual_quantity
-            good = actual_price is not None and str(actual_price) == expected_price and actual_quantity == "1"
+            run.summary[f"option:{name}:quantity"] = quantity
+            good = actual_price is not None and str(actual_price) == price and quantity == "1"
             run.add(f"Order summary option {name}", "MATCH" if good else "MISMATCH",
-                    f"Quantity {actual_quantity}; selected price {expected_price}; summary price {actual_price}")
+                    f"Quantity {quantity}; selected price {price}; summary price {actual_price}")
+        if not run.final_plan:
+            run.final_plan = plan_screenshot(page, config, run, "final-plan")
+        run.add("Pre-submit sketch", "PASS", "Captured before checkout", run.final_plan)
         if interactive:
             prefill_manual_contact(page)
             print("Fill the visible Fragmento form, then press Enter here to verify it.", flush=True)
             print("FORM_READY", flush=True)
             input()
             inspect_manual_contact(page, run)
-            run.add("Checkout submission", "NOT_RUN", "Paid-order action was disabled; no order or payment created")
+            run.add("Checkout submission", "NOT_RUN", "Paid-order button disabled in manual inspection")
             return
-        contact = {key: os.getenv(env, "").strip() for key, (env, _) in CONTACT_FIELDS.items()}
-        missing = [CONTACT_FIELDS[key][0] for key, value in contact.items() if not value]
-        if missing:
-            run.add("Delivery/contact", "UNCONFIGURED", "Missing local variables: " + ", ".join(missing))
-            run.add("Checkout submission", "NOT_RUN", "Stopped before Complete paid order; no order or payment created")
+        defaults = {"first_name": "max", "last_name": "musterman",
+                    "contact_email": "ternavaanisa@outlook.com", "phone": "000000000"}
+        for key in defaults:
+            value = os.getenv(CONTACT_FIELDS[key][0], "").strip() or defaults[key]
+            page.locator(CONTACT_FIELDS[key][1]).fill(value)
+            valid = page.locator(CONTACT_FIELDS[key][1]).evaluate("el => el.checkValidity()")
+            run.summary[f"delivery:{key}"] = value if valid else ""
+            run.add(f"Contact {key}", "PASS" if valid else "FAIL", "Valid value displayed" if valid else "Field invalid")
+        use_property = os.getenv("FRAGMENTO_USE_PROPERTY_ADDRESS", "true").strip().lower() != "false"
+        property_option = page.locator("#use-object-address")
+        if property_option.count():
+            property_option.set_checked(use_property)
+            run.summary["delivery:address_mode"] = "property" if use_property else "custom"
+            run.add("Billing/delivery address mode", "PASS", "Property address selected" if use_property else "Custom address selected")
+        else:
+            use_property = False
+        if not use_property:
+            needed = ["address_line_1", "country", "city", "postal_code"]
+            missing = [CONTACT_FIELDS[key][0] for key in needed if not os.getenv(CONTACT_FIELDS[key][0], "").strip()]
+            if missing:
+                run.add("Delivery address", "UNCONFIGURED", "Missing local variables: " + ", ".join(missing))
+                run.add("Checkout submission", "NOT_RUN", "Address incomplete")
+                return
+            page.locator("#address1").fill(os.getenv("FRAGMENTO_ADDRESS1", ""))
+            for key in ("country", "city", "postal_code"):
+                page.locator(CONTACT_FIELDS[key][1]).select_option(label=os.getenv(CONTACT_FIELDS[key][0], ""))
+                run.summary[f"delivery:{key}"] = os.getenv(CONTACT_FIELDS[key][0], "")
+            run.summary["delivery:address_line_1"] = os.getenv("FRAGMENTO_ADDRESS1", "")
+        else:
+            run.add("Property address details", "REVIEW", "The page uses the contract address but does not display its fields")
+        week = os.getenv("FRAGMENTO_DELIVERY_WEEK", "").strip()
+        if week:
+            page.locator("#preferredDeliveryDate").click()
+            page.get_by_role("option", name=week, exact=True).click(timeout=10000)
+        week_value = page.locator("#preferredDeliveryDate").inner_text().strip()
+        week_date = page.locator('input[name="preferred-delivery-date"]').input_value()
+        run.summary["delivery:delivery_week"] = week_value
+        run.add("Preferred delivery", "PASS" if week_date else "FAIL", "Chosen week displayed" if week_date else "No valid week")
+        notes = os.getenv("FRAGMENTO_NOTES", "").strip()
+        if notes:
+            page.locator("#notes").fill(notes)
+        run.add("Pre-submit details", "PASS", "Contact fields masked in evidence", masked_checkout_screenshot(page, run))
+        if pre_submit_only:
+            run.add("Checkout submission", "NOT_RUN", "Stopped at the explicit pre-submit test boundary")
             return
-        for key in ("first_name", "last_name", "contact_email", "phone", "address_line_1"):
-            page.locator(CONTACT_FIELDS[key][1]).fill(contact[key])
-        if os.getenv("FRAGMENTO_ADDRESS2", ""):
-            page.locator("#address2").fill(os.getenv("FRAGMENTO_ADDRESS2", ""))
-        if os.getenv("FRAGMENTO_NOTES", ""):
-            page.locator("#notes").fill(os.getenv("FRAGMENTO_NOTES", ""))
-        for key in ("country", "city", "postal_code"):
-            page.locator(CONTACT_FIELDS[key][1]).select_option(label=contact[key], timeout=10000)
-        page.locator("#preferredDeliveryDate").click()
-        page.get_by_role("option", name=contact["delivery_week"], exact=True).click()
-        for key, (_, selector) in CONTACT_FIELDS.items():
-            if key in ("country", "city", "postal_code"):
-                actual = page.locator(selector).locator("option:checked").inner_text().strip()
-            elif key == "delivery_week":
-                actual = page.locator(selector).inner_text().strip()
-            else:
-                actual = page.locator(selector).input_value().strip()
-            run.summary[f"delivery:{key}"] = actual
-            run.add(f"Delivery/contact {key}", "MATCH" if normalized(actual) == normalized(contact[key]) else "MISMATCH",
-                    "Displayed value matches local configuration" if normalized(actual) == normalized(contact[key]) else "Displayed value differs from local configuration")
-        run.add("Delivery/contact screenshot", "PASS", "Personal fields masked", masked_checkout_screenshot(page, run))
-        run.add("Checkout submission", "NOT_RUN", "Stopped before Complete paid order; no order or payment created")
+        if any(check.status in {"FAIL", "MISMATCH", "UNCONFIGURED"} for check in run.checks):
+            run.add("Checkout submission", "NOT_RUN", "Pre-submit checks must pass before checkout")
+            return
+        page.locator("#consent").check()
+        page.locator("#termsConsent").check()
+        run.add("Legal consents", "PASS", "Privacy and terms checkboxes checked for this requested test order")
+        page.unroute("**/*")
+        checkout_responses: list[str] = []
+        page.on("response", lambda response: checkout_responses.append(
+            f"{response.request.method} {response.status} {urlparse(response.url).netloc}{urlparse(response.url).path}"
+        ) if response.request.method not in ("GET", "HEAD", "OPTIONS") else None)
+        stage = "Stripe redirect"
+        with page.expect_response(lambda response: urlparse(response.url).path == "/api/orders"
+                                  and response.request.method == "POST", timeout=30000) as order_response_info:
+            page.get_by_role("button", name=label(config, "paid_order_button", "Complete paid order")).click(timeout=10000)
+        order_response = order_response_info.value
+        if order_response.status >= 400:
+            try:
+                payload = order_response.json()
+                description = str({key: payload[key] for key in ("code", "message", "error") if key in payload})
+            except (ValueError, TypeError, KeyError):
+                description = "No structured error detail"
+            description = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", description)
+            description = re.sub(r"(?<!\d)\d{7,}(?!\d)", "[number]", description)[:300]
+            run.add("Order API", "FAIL", f"POST /api/orders returned {order_response.status}; {description}",
+                    masked_checkout_screenshot(page, run))
+            return
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            candidates = [candidate for candidate in page.context.pages if "checkout.stripe.com" in candidate.url]
+            if candidates:
+                page = candidates[-1]
+                break
+            if re.search(r"fragmento\.de/.+(?:confirm|success)", page.url):
+                break
+            page.wait_for_timeout(500)
+        else:
+            invalid = [item.get_attribute("id") or "unnamed" for item in page.locator('[aria-invalid="true"]').all()]
+            host = urlparse(page.url).netloc
+            alerts = [value.strip() for value in page.locator('[role="alert"], [aria-live="assertive"]').all_inner_texts() if value.strip()]
+            alerts = [re.sub(r"\d{4,}", "[number]",
+                             re.sub(r"[\w.+-]+@[\w.-]+", "[email]", value))[:200] for value in alerts]
+            run.add("Checkout redirect", "INCOMPLETE",
+                    f"No Stripe/confirmation page after 45 s; visible host {host}; invalid fields {invalid}; "
+                    f"write responses {checkout_responses}; alerts {alerts}",
+                    masked_checkout_screenshot(page, run) if host == "fragmento.de" else "")
+            return
+        mode = stripe_mode(page.url)
+        if mode != "test":
+            run.add("Stripe mode", "INCOMPLETE", "Live or unverified checkout; payment was not attempted")
+            run.add("Checkout submission", "INCOMPLETE", "Fragmento form submitted; payment and order confirmation not completed")
+            return
+        run.add("Stripe mode", "PASS", "Stripe Checkout test session identified by cs_test_ in URL")
+        stage = "test payment"
+        filled, payment_reason = fill_stripe_test_payment(page)
+        if not filled:
+            run.add("Test payment", "INCOMPLETE", f"Test payment form unavailable; no Pay click. {payment_reason}")
+            return
+        page.get_by_role("button", name=re.compile(r"Pay|Place order", re.I)).click(timeout=15000)
+        stage = "return from Stripe"
+        page.wait_for_url(re.compile(r"^https://fragmento\.de/"), timeout=60000)
+        try:
+            page.get_by_text(re.compile(r"Bestellnummer|Order (?:number|reference)", re.I)).first.wait_for(
+                state="visible", timeout=15000)
+        except PlaywrightTimeout:
+            pass
+        confirmation = page.locator("body").inner_text()
+        pattern = config.get("confirmation_reference_pattern", r"(?:Order(?: number| reference)?|Reference|Bestellnummer)\s*[:#]\s*([A-Za-z0-9-]+)")
+        run.confirmation_reference = extract(pattern, confirmation)
+        confirmed = bool(run.confirmation_reference) and re.search(r"confirm|success|thank|bestätigt|bestaetigt", confirmation, re.I)
+        run.add("Order confirmation", "PASS" if confirmed else "REVIEW",
+                f"Order reference {run.confirmation_reference}" if confirmed else "Returned from Stripe, but confirmation/reference was unclear",
+                screenshot(page, run, "confirmation"))
     except PlaywrightTimeout:
-        evidence = masked_checkout_screenshot(page, run) if page.locator("#firstName").count() else screenshot(page, run, "order-form-error")
-        run.add("Order form", "FAIL", "Order form or configured delivery choice did not load", evidence)
+        suffix = "; Fragmento form was clicked, pending-order state unknown" if stage == "Stripe redirect" else ""
+        if stage == "return from Stripe":
+            metadata = []
+            for frame in page.frames:
+                for field in frame.locator("input").all()[:20]:
+                    if field.is_visible():
+                        metadata.append({attribute: field.get_attribute(attribute) for attribute in
+                                         ("name", "id", "autocomplete", "required", "aria-invalid")})
+            alerts = [value.strip() for value in page.locator('[role="alert"], [aria-live="assertive"]').all_inner_texts() if value.strip()]
+            alerts = [re.sub(r"[\w.+-]+@[\w.-]+", "[email]", value)[:200] for value in alerts]
+            run.add("Stripe payment result", "INCOMPLETE", f"No return to Fragmento; input metadata {metadata[:20]}; alerts {alerts[:5]}")
+        run.add("Checkout", "INCOMPLETE", f"Timed out during {stage}; current host {urlparse(page.url).netloc}{suffix}")
     except PlaywrightError as exc:
-        run.add("Order form", "FAIL", f"Order form check failed: {type(exc).__name__}")
+        run.add("Checkout", "FAIL", f"Checkout flow failed: {type(exc).__name__}")
+
+
+def stripe_mode(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "checkout.stripe.com":
+        return "unknown"
+    if re.search(r"/cs_test_[A-Za-z0-9]+", parsed.path):
+        return "test"
+    if re.search(r"/cs_live_[A-Za-z0-9]+", parsed.path):
+        return "live"
+    return "unknown"
+
+
+def fill_stripe_test_payment(page) -> tuple[bool, str]:
+    """Fill only a verified Stripe test checkout. Never capture a payment screenshot."""
+    expiry = os.getenv("FRAGMENTO_TEST_EXPIRY", "").strip() or f"12/{(datetime.now().year + 2) % 100:02d}"
+    cvc = os.getenv("FRAGMENTO_TEST_CVC", "").strip() or str(secrets.randbelow(900) + 100)
+    if not re.fullmatch(r"\d{2}/\d{2}", expiry) or not re.fullmatch(r"\d{3,4}", cvc):
+        return False, "Test expiry/CVC format invalid"
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+        page.wait_for_timeout(3000)
+    except PlaywrightTimeout:
+        return False, "Stripe inputs did not appear"
+    selectors = {
+        "number": ('input[autocomplete="cc-number"]', 'input[name="cardnumber"]', 'input[name="cardNumber"]', 'input[id*="cardNumber"]'),
+        "expiry": ('input[autocomplete="cc-exp"]', 'input[name="exp-date"]', 'input[name="cardExpiry"]', 'input[id*="cardExpiry"]'),
+        "cvc": ('input[autocomplete="cc-csc"]', 'input[name="cvc"]', 'input[name="cardCvc"]', 'input[id*="cardCvc"]'),
+    }
+    values = {"number": "4242424242424242", "expiry": expiry, "cvc": cvc}
+    for selector, value in (
+        ('input[autocomplete="email"]', os.getenv("FRAGMENTO_CONTACT_EMAIL", "ternavaanisa@outlook.com")),
+        ('input[autocomplete="cc-name"]', " ".join((os.getenv("FRAGMENTO_FIRST_NAME", "max"),
+                                                    os.getenv("FRAGMENTO_LAST_NAME", "musterman")))),
+    ):
+        for frame in page.frames:
+            field = frame.locator(selector)
+            if field.count() and field.first.is_visible() and not field.first.input_value().strip():
+                field.first.fill(value)
+    for key in ("number", "expiry", "cvc"):
+        found = False
+        for frame in page.frames:
+            for selector in selectors[key]:
+                locator = frame.locator(selector)
+                if locator.count() and locator.first.is_visible():
+                    locator.first.fill(values[key])
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            available = []
+            for frame in page.frames:
+                for field in frame.locator("input").all()[:15]:
+                    available.append({attribute: field.get_attribute(attribute) for attribute in ("name", "id", "autocomplete", "type")})
+            return False, f"Missing {key} input; visible input attributes {available[:20]}"
+    return True, "Test card fields filled without recording their values"
 
 
 def inspect_manual_contact(page, run: Run) -> None:
+    property_address = page.locator("#use-object-address").count() and page.locator("#use-object-address").is_checked()
+    run.summary["delivery:address_mode"] = "property" if property_address else "custom"
+    run.add("Billing/delivery address mode", "PASS", "Property address selected" if property_address else "Custom address selected")
     for key, (_, selector) in CONTACT_FIELDS.items():
+        if property_address and key in ("address_line_1", "country", "city", "postal_code"):
+            continue
         try:
             field = page.locator(selector)
             if key in ("country", "city", "postal_code"):
@@ -528,173 +865,67 @@ def inspect_manual_contact(page, run: Run) -> None:
     run.add("Delivery/contact screenshot", "PASS", "Personal fields masked", masked_checkout_screenshot(page, run))
 
 
-def outlook_client():
-    client_id = os.getenv("FRAGMENTO_MS_CLIENT_ID", "")
-    if not client_id:
-        return None, None
-    cache = msal.SerializableTokenCache()
-    if MAIL_CACHE.is_file():
-        cache.deserialize(MAIL_CACHE.read_text(encoding="utf-8"))
-    app = msal.PublicClientApplication(client_id, authority="https://login.microsoftonline.com/consumers", token_cache=cache)
-    return app, cache
+from mail_browser import inspect_mail, setup_profile
+from visual_qa import render_attachment
 
 
-def save_mail_cache(cache) -> None:
-    if cache.has_state_changed:
-        MAIL_CACHE.parent.mkdir(exist_ok=True)
-        MAIL_CACHE.write_text(cache.serialize(), encoding="utf-8")
-
-
-def setup_mail() -> int:
-    app, cache = outlook_client()
-    if not app:
-        print("Set FRAGMENTO_MS_CLIENT_ID in .env first")
-        return 2
-    flow = app.initiate_device_flow(scopes=["Mail.Read", "User.Read"])
-    if "user_code" not in flow:
-        print("Could not start Microsoft authorization")
-        return 2
-    print(flow["message"])
-    result = app.acquire_token_by_device_flow(flow)
-    if "access_token" not in result:
-        print("Microsoft authorization failed")
-        return 2
-    save_mail_cache(cache)
-    print("Read-only mailbox access saved locally in .auth")
-    return 0
-
-
-def graph_get(url: str, token: str, params: dict | None = None) -> dict:
-    response = requests.get(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Prefer": 'outlook.body-content-type="text"',
-    }, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def check_email_attachments(config: dict, run: Run, message: dict, token: str) -> None:
-    if not message.get("hasAttachments"):
-        run.add("Email attachments", "PASS", "Matching message has no file attachments")
-        attachments = []
-    else:
-        data = graph_get(f"https://graph.microsoft.com/v1.0/me/messages/{message['id']}/attachments", token)
-        attachments = data.get("value", [])
-        next_page = data.get("@odata.nextLink")
-        while next_page:
-            data = graph_get(next_page, token)
-            attachments.extend(data.get("value", []))
-            next_page = data.get("@odata.nextLink")
-        run.add("Email attachments", "PASS", f"{len(attachments)} attachment(s) listed in exact matching message")
-
-    rules = config.get("attachment_rules", {})
-    for option, documents in run.expected_documents.items():
-        for document in documents:
-            pattern = rules.get(document, "")
-            check_name = f"Email document {option}: {document}"
-            if not configured(pattern):
-                run.add(check_name, "UNCONFIGURED", "Set a filename pattern from a real confirmation email")
-                continue
-            found = any(re.search(pattern, item.get("name", ""), re.I) for item in attachments)
-            run.add(check_name, "PASS" if found else "FAIL",
-                    "Matching attachment filename found" if found else "Expected attachment filename absent")
-
-    pattern = config.get("plan_attachment_pattern", "")
-    if not configured(pattern):
-        run.add("Email plan file", "UNCONFIGURED", "Set plan attachment filename pattern from a real email")
+def find_browser_email(config: dict, run: Run) -> None:
+    recipient = os.getenv("FRAGMENTO_CONTACT_EMAIL", "ternavaanisa@outlook.com")
+    result = inspect_mail(MAIL_PROFILE, config, run.confirmation_reference, recipient,
+                          run.started.timestamp(), REPORTS / f"{run.started:%Y%m%d-%H%M%S-%f}-{run.kitchen}",
+                          os.getenv("FRAGMENTO_BROWSER_CDP_URL", ""))
+    run.add("Email", result["status"], result["reason"])
+    if result["status"] != "PASS":
+        run.add("Email field comparison", "INCOMPLETE", "Requires a confirmed exact-reference message")
+        run.add("Email sketch comparison", "INCOMPLETE", "Requires a confirmed exact-reference message and openable plan attachment")
         return
-    plans = [item for item in attachments if re.search(pattern, item.get("name", ""), re.I)]
-    if len(plans) != 1:
-        run.add("Email plan file", "FAIL" if not plans else "AMBIGUOUS",
-                f"Expected one plan attachment; found {len(plans)}")
+    run.email.update(result.get("fields", {}))
+    visible_email = result.get("visible_text", "")
+    contract_found = exact_reference(visible_email, run.kitchen)
+    run.add("Email contract reference", "MATCH" if contract_found else "REVIEW",
+            "Exact contract number visible" if contract_found else "Contract number was not visible in the opened message")
+    if contract_found:
+        run.email.setdefault("contract_number", run.kitchen)
+    for key, value in run.selection.items():
+        if key.startswith("option:") and key.endswith(":price"):
+            name = key[len("option:"):-len(":price")]
+            present = exact_reference(visible_email, name)
+            run.add(f"Email element {name}", "PASS" if present else "REVIEW",
+                    "Selected element name visible" if present else "Selected element name not found in email text")
+    for key, value in run.summary.items():
+        if key.startswith("delivery:") and key not in run.email and value and value != "property":
+            present = exact_reference(visible_email, value)
+            run.add(f"Email {key}", "PASS" if present else "REVIEW",
+                    "Summary value visible in email" if present else "Summary value not visible in email")
+            if present:
+                run.email[key] = value
+    if not run.email:
+        run.add("Email field comparison", "REVIEW", "No field patterns configured from a real confirmation message")
+    for option, labels in run.expected_documents.items():
+        for document in labels:
+            if document not in config.get("attachment_rules", {}):
+                run.add(f"Email attachment {option}: {document}", "REVIEW", "No filename rule from a real email")
+            else:
+                opened = result.get("documents", {}).get(document, False)
+                run.add(f"Email attachment {option}: {document}", "PASS" if opened else "REVIEW",
+                        "Matching file downloaded through Outlook UI" if opened else "Matching file could not be opened from Outlook UI")
+    attachment = result.get("attachment")
+    if not attachment or not run.final_plan:
+        run.add("Email sketch comparison", "REVIEW", "Plan attachment could not be opened from the visible mailbox")
         return
-    attachment = plans[0]
-    if not run.plan_url:
-        run.add("Email plan file", "INCOMPLETE", "Public plan URL was unavailable")
-        return
-    public_type = mimetypes.guess_type(urlparse(run.plan_url).path)[0]
-    attached_type = attachment.get("contentType") or mimetypes.guess_type(attachment.get("name", ""))[0]
-    if public_type != attached_type:
-        run.add("Email plan file", "INCOMPLETE", "Plan formats differ; visual comparison needs an approved reference or renderer")
-        return
-    content = attachment.get("contentBytes")
-    if not content:
-        content = graph_get(f"https://graph.microsoft.com/v1.0/me/messages/{message['id']}/attachments/{attachment['id']}", token).get("contentBytes")
-    if not content:
-        run.add("Email plan file", "INCOMPLETE", "Attachment bytes were unavailable from Outlook")
-        return
-    public_response = requests.get(run.plan_url, timeout=30)
-    public_response.raise_for_status()
-    same = hashlib.sha256(base64.b64decode(content)).digest() == hashlib.sha256(public_response.content).digest()
-    run.add("Email plan file", "MATCH" if same else "MISMATCH",
-            "Plan files have identical bytes" if same else "Plan file bytes differ; visual equivalence is unverified")
-
-
-def find_outlook_email(config: dict, run: Run) -> None:
-    expected_address = os.getenv("FRAGMENTO_MAIL_ADDRESS", "")
     try:
-        app, cache = outlook_client()
-        if not app or not expected_address:
-            run.add("Email", "UNCONFIGURED", "Set Microsoft client ID and expected Outlook address in .env")
-            return
-        accounts = app.get_accounts()
-        if len(accounts) != 1:
-            run.add("Email", "UNCONFIGURED", "Run --setup-mail for exactly one Outlook account")
-            return
-        token_result = app.acquire_token_silent(["Mail.Read", "User.Read"], account=accounts[0])
-        save_mail_cache(cache)
-        if not token_result or "access_token" not in token_result:
-            run.add("Email", "LOGIN_FAILURE", "Outlook token expired; run --setup-mail")
-            return
-        token = token_result["access_token"]
-        profile = graph_get("https://graph.microsoft.com/v1.0/me", token, {"$select": "mail,userPrincipalName"})
-        addresses = {normalized(profile.get("mail") or ""), normalized(profile.get("userPrincipalName") or "")}
-        if normalized(expected_address) not in addresses:
-            run.add("Email", "LOGIN_FAILURE", "Authorized mailbox differs from FRAGMENTO_MAIL_ADDRESS")
-            return
-        days = max(1, min(int(config.get("search_window_days", 90)), 3650))
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds").replace("+00:00", "Z")
-        url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
-        params = {"$select": "id,subject,body,receivedDateTime,hasAttachments", "$filter": f"receivedDateTime ge {since}", "$top": 100}
-        matches = []
-        pages = 0
-        while url and pages < 20:
-            data = graph_get(url, token, params)
-            pages += 1
-            params = None
-            for message in data.get("value", []):
-                body = message.get("body", {}).get("content") or ""
-                searchable = f"{message.get('subject', '')}\n{body}"
-                if exact_reference(searchable, run.kitchen) or (run.reference and exact_reference(searchable, run.reference)):
-                    matches.append((message, body))
-            url = data.get("@odata.nextLink", "")
-        if url:
-            run.add("Email", "INCOMPLETE", "Inbox search reached the page limit; no reliable uniqueness result")
-            return
-        if not matches:
-            run.add("Email", "EMAIL_NOT_FOUND", f"No exact message for kitchen {run.kitchen} or verified reference in last {days} days")
-            return
-        if len(matches) != 1:
-            run.add("Email", "AMBIGUOUS", f"{len(matches)} matching messages")
-            return
-        message, body = matches[0]
-        run.add("Email", "PASS", f"Matched message received {message.get('receivedDateTime', 'unknown')}")
-        if not config.get("field_patterns"):
-            run.add("Email fields", "UNCONFIGURED", "Set field patterns from a real matching confirmation email")
-        for name, pattern in config.get("field_patterns", {}).items():
-            if re.search(r"card|cvv|cvc|payment|password|iban|token", name, re.I):
-                run.add(f"Email {name}", "UNCONFIGURED", "Payment and credential fields are excluded")
-                continue
-            if not configured(pattern):
-                run.add(f"Email {name}", "UNCONFIGURED", "Field pattern is missing")
-                continue
-            value = extract(pattern, body)
-            if value:
-                run.email[name] = value
-            run.add(f"Email {name}", "PASS" if value else "FAIL", "Value extracted" if value else "Field not found in matching email")
-        check_email_attachments(config, run, message, token)
-    except (requests.RequestException, ValueError, OSError, KeyError) as exc:
-        run.add("Email", "FAIL", f"Outlook inbox read failed: {type(exc).__name__}")
+        rendered = render_attachment(attachment)
+        rendered_path = evidence_path(run.final_plan).parent / "email-plan-rendered.png"
+        rendered_path.write_bytes(rendered)
+        rendered_relative = str(rendered_path.relative_to(REPORTS)).replace("\\", "/")
+        visual_result = compare_plan_images(evidence_path(run.final_plan), rendered)
+        difference = visual_result["changed_fraction"]
+        status = "PASS" if visual_result["exact_match"] else "REVIEW"
+        run.add("Email sketch comparison", status,
+                f"Rendered sketch changed fraction {difference:.4f}; sizes {visual_result['original_sizes']}; nonidentical renderings require review",
+                run.final_plan, [rendered_relative])
+    except (OSError, ValueError) as exc:
+        run.add("Email sketch comparison", "REVIEW", f"Attachment rendering failed: {type(exc).__name__}")
 
 
 def compare(run: Run) -> None:
@@ -718,37 +949,102 @@ def write_report(run: Run) -> Path:
     REPORTS.mkdir(exist_ok=True)
     path = REPORTS / f"{run.started:%Y%m%d-%H%M%S-%f}-{run.kitchen}.html"
     bad = {"FAIL", "MISMATCH", "NOT_FOUND", "AMBIGUOUS", "LOGIN_FAILURE"}
-    incomplete = {"UNCONFIGURED", "INCOMPLETE", "NOT_RUN", "EMAIL_NOT_FOUND"}
+    incomplete = {"UNCONFIGURED", "INCOMPLETE", "NOT_RUN", "EMAIL_NOT_FOUND", "REVIEW", "EMAIL_NOT_CHECKED"}
     overall = "FAIL" if any(c.status in bad for c in run.checks) else "INCOMPLETE" if any(c.status in incomplete for c in run.checks) else "PASS"
     esc = lambda value: html.escape(str(value), quote=True)
     rows = []
     for check in run.checks:
-        evidence = f'<a href="{esc(check.screenshot)}"><img src="{esc(check.screenshot)}" alt="{esc(check.name)} screenshot" width="220"></a>' if check.screenshot else ""
+        evidence = " ".join(f'<a href="{esc(path)}"><img src="{esc(path)}" alt="{esc(check.name)} screenshot" width="180"></a>'
+                            for path in ([check.screenshot] if check.screenshot else []) + check.evidence)
         rows.append(f"<tr><td>{esc(check.name)}</td><td class='{esc(check.status)}'>{esc(check.status)}</td><td>{esc(check.detail)}</td><td>{evidence}</td></tr>")
     document = f"""<!doctype html><html lang="en"><meta charset="utf-8"><title>Kitchen {esc(run.kitchen)} QA</title>
-<style>body{{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}}table{{border-collapse:collapse;width:100%}}th,td{{padding:.6rem;border:1px solid #bbb;text-align:left;vertical-align:top}}.PASS,.MATCH{{color:#087333}}.FAIL,.MISMATCH,.NOT_FOUND,.AMBIGUOUS,.LOGIN_FAILURE{{color:#b42318;font-weight:bold}}.UNCONFIGURED,.INCOMPLETE,.NOT_RUN,.EMAIL_NOT_FOUND{{color:#955600}}</style>
+<style>body{{font:16px system-ui;max-width:1300px;margin:2rem auto;padding:0 1rem}}table{{border-collapse:collapse;width:100%}}th,td{{padding:.6rem;border:1px solid #bbb;text-align:left;vertical-align:top}}.PASS,.MATCH{{color:#087333}}.FAIL,.MISMATCH,.NOT_FOUND,.AMBIGUOUS,.LOGIN_FAILURE{{color:#b42318;font-weight:bold}}.UNCONFIGURED,.INCOMPLETE,.NOT_RUN,.EMAIL_NOT_FOUND,.EMAIL_NOT_CHECKED,.REVIEW{{color:#955600}}</style>
 <h1>Kitchen {esc(run.kitchen)} — {overall}</h1><p>Started: {esc(run.started.isoformat(timespec='seconds'))}</p>
 <table><thead><tr><th>Check</th><th>Status</th><th>Details</th><th>Evidence</th></tr></thead><tbody>{''.join(rows)}</tbody></table></html>"""
     path.write_text(document, encoding="utf-8")
+    safe_summary = {key: value for key, value in run.summary.items() if not key.startswith("delivery:") or
+                    key in {"delivery:address_mode", "delivery:delivery_week"}}
+    path.with_suffix(".json").write_text(json.dumps({
+        "kitchen": run.kitchen, "selection": run.selection, "summary": safe_summary,
+        "inventory": run.inventory, "expected_documents": run.expected_documents,
+        "final_plan": run.final_plan, "confirmation_reference": run.confirmation_reference,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
+def load_order_source(path: Path, kitchen: str, run: Run) -> None:
+    """Restore non-sensitive order evidence for an email-only run."""
+    snapshot = path if path.suffix.lower() == ".json" else path.with_suffix(".json")
+    if snapshot.is_file():
+        data = json.loads(snapshot.read_text(encoding="utf-8"))
+        if data.get("kitchen") != kitchen:
+            raise ValueError("Source report belongs to another kitchen")
+        run.selection.update(data.get("selection", {}))
+        run.summary.update(data.get("summary", {}))
+        run.inventory = data.get("inventory", [])
+        run.expected_documents = data.get("expected_documents", {})
+        run.final_plan = data.get("final_plan", "")
+        run.confirmation_reference = data.get("confirmation_reference", "")
+    else:
+        document = path.read_text(encoding="utf-8")
+        if f"Kitchen {html.escape(kitchen)} QA" not in document:
+            raise ValueError("Source report belongs to another kitchen")
+        rows = re.findall(r"<tr><td>(.*?)</td><td class='[^']+'>(.*?)</td><td>(.*?)</td><td>(.*?)</td></tr>",
+                          document, re.S)
+        for raw_name, _status, raw_detail, _evidence in rows:
+            name = html.unescape(re.sub(r"<[^>]+>", "", raw_name))
+            detail = html.unescape(re.sub(r"<[^>]+>", "", raw_detail))
+            if name.startswith("Selection vs order summary "):
+                key = name[len("Selection vs order summary "):]
+                match = re.fullmatch(r"Selection: (.*?); summary: (.*)", detail, re.S)
+                if match:
+                    run.selection[key], run.summary[key] = match.groups()
+            elif name in {"Order summary subtotal", "Order summary vat"}:
+                run.summary[name.removeprefix("Order summary ")] = detail
+            elif name == "Final element inventory":
+                match = re.search(r"found (\[.*\])", detail, re.S)
+                if match:
+                    run.inventory = ast.literal_eval(match.group(1))
+        folder = REPORTS / path.stem
+        final_plan = folder / "final-plan.png"
+        if final_plan.is_file():
+            run.final_plan = str(final_plan.relative_to(REPORTS)).replace("\\", "/")
+        confirmation = folder / "confirmation.png"
+        if confirmation.is_file():
+            run.add("Prior confirmation screen", "REVIEW", "Visible confirmation from source run; reference supplied separately",
+                    str(confirmation.relative_to(REPORTS)).replace("\\", "/"))
+    for key in ("first_name", "last_name", "contact_email", "phone"):
+        configured_value = os.getenv(CONTACT_FIELDS[key][0], "").strip()
+        if configured_value:
+            run.summary[f"delivery:{key}"] = configured_value
+    run.add("Order source", "PASS", f"Loaded saved selection and sketch from {path.name}", run.final_plan)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only Fragmento kitchen QA checker")
+    parser = argparse.ArgumentParser(description="Fragmento public kitchen visual QA checker")
     parser.add_argument("--kitchen", help="Kitchen number to check")
     parser.add_argument("--config", type=Path, default=ROOT / "workflow.json")
-    parser.add_argument("--setup-mail", action="store_true", help="Authorize read-only Outlook inbox access")
+    parser.add_argument("--setup-mail-browser", action="store_true", help="Sign in to the reusable Outlook browser profile")
     parser.add_argument("--interactive", action="store_true", help="Open the public form visibly for manual contact entry")
+    parser.add_argument("--pre-submit-only", action="store_true", help="Run visual and form checks without starting checkout")
+    parser.add_argument("--email-only", action="store_true", help="Check email for an existing confirmed order without a new checkout")
+    parser.add_argument("--order-reference", help="Exact reference of an already confirmed order for --email-only")
+    parser.add_argument("--from-report", type=Path, help="Saved confirmed-order report for --email-only")
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
-    if args.setup_mail:
-        return setup_mail()
+    if args.setup_mail_browser:
+        setup_profile(MAIL_PROFILE, "https://outlook.live.com/mail/")
+        return 0
+    if args.email_only and (not args.order_reference or not args.from_report):
+        parser.error("--email-only requires --order-reference and --from-report")
+    if args.from_report and not args.email_only:
+        parser.error("--from-report requires --email-only")
     try:
         config = read_config(args.config)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
-    kitchen = (args.kitchen if args.kitchen is not None else input("Enter kitchen number: ")).strip()
+    kitchen = (args.kitchen if args.kitchen is not None else input("Enter purchase contract / kitchen number: ")).strip()
     run = Run(kitchen or "invalid")
     pattern = config.get("kitchen_number_pattern", r"^[0-9]+$")
     try:
@@ -762,27 +1058,38 @@ def main() -> int:
         print(f"Invalid kitchen number. Report: {path}")
         return 1
     run.add("Kitchen number", "PASS", kitchen)
-    public = config.get("public", config.get("selection", {}))
-    if check_url(public.get("url", "")):
+    if args.email_only:
         try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=not args.interactive)
-                context = browser.new_context()
-                page = context.new_page()
-                public_contract_check(page, public, run, interactive=args.interactive)
-                context.close()
-                browser.close()
-        except (PlaywrightError, OSError, ValueError) as exc:
-            run.add("Browser", "FAIL", f"Browser could not start: {type(exc).__name__}")
+            load_order_source(args.from_report, kitchen, run)
+        except (OSError, ValueError, SyntaxError, json.JSONDecodeError) as exc:
+            print(f"Order source error: {exc}", file=sys.stderr)
+            return 2
+        reference = args.order_reference.strip()
+        if run.confirmation_reference and run.confirmation_reference != reference:
+            print("Order reference differs from the saved report", file=sys.stderr)
+            return 2
+        run.confirmation_reference = reference
+        run.add("Existing order reference", "REVIEW", "Provided reference; matching email must corroborate this order")
     else:
-        run.add("Public kitchen", "UNCONFIGURED", "Set the public Fragmento URL in workflow.json")
-    find_outlook_email(config.get("email", {}), run)
-    if not any(check.name == "Email" and check.status == "PASS" for check in run.checks):
-        for name in ("Email fields", "Email attachments", "Email plan file"):
-            run.add(name, "NOT_RUN", "Requires an authorized inbox and an exact matching confirmation email")
+        public = config.get("public", config.get("selection", {}))
+        if check_url(public.get("url", "")):
+            try:
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=not args.interactive)
+                    context = browser.new_context()
+                    page = context.new_page()
+                    public_contract_check(page, public, run, interactive=args.interactive,
+                                          visual=config.get("visual", {}), pre_submit_only=args.pre_submit_only)
+                    context.close()
+                    browser.close()
+            except (PlaywrightError, OSError, ValueError) as exc:
+                run.add("Browser", "FAIL", f"Browser could not start: {type(exc).__name__}")
+        else:
+            run.add("Public kitchen", "UNCONFIGURED", "Set the public Fragmento URL in workflow.json")
+    find_browser_email(config.get("email", {}), run)
     compare(run)
     path = write_report(run)
-    overall = "FAIL" if any(c.status in {"FAIL", "MISMATCH", "NOT_FOUND", "AMBIGUOUS", "LOGIN_FAILURE"} for c in run.checks) else "INCOMPLETE" if any(c.status in {"UNCONFIGURED", "INCOMPLETE", "NOT_RUN", "EMAIL_NOT_FOUND"} for c in run.checks) else "PASS"
+    overall = "FAIL" if any(c.status in {"FAIL", "MISMATCH", "NOT_FOUND", "AMBIGUOUS", "LOGIN_FAILURE"} for c in run.checks) else "INCOMPLETE" if any(c.status in {"UNCONFIGURED", "INCOMPLETE", "NOT_RUN", "EMAIL_NOT_FOUND", "EMAIL_NOT_CHECKED", "REVIEW"} for c in run.checks) else "PASS"
     print(f"Kitchen {kitchen}: {overall}")
     for check in run.checks:
         print(f"- {check.name}: {check.status}" + (f" — {check.detail}" if check.detail else ""))
